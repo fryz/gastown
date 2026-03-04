@@ -13,6 +13,7 @@ import (
 )
 
 var wlDoneEvidence string
+var wlDonePRMode bool
 
 var wlDoneCmd = &cobra.Command{
 	Use:   "done <wanted-id>",
@@ -27,9 +28,13 @@ The --evidence flag provides the evidence URL (PR link, commit hash, etc.).
 A completion ID is generated as c-<hash> where hash is derived from the
 wanted ID, rig handle, and timestamp.
 
+With --pr-mode (Phase 2), this creates a DoltHub PR instead of writing
+directly, enabling review and trust-based auto-merge.
+
 Examples:
   gt wl done w-abc123 --evidence 'https://github.com/org/repo/pull/123'
-  gt wl done w-abc123 --evidence 'commit abc123def'`,
+  gt wl done w-abc123 --evidence 'commit abc123def'
+  gt wl done w-abc123 --evidence 'https://...' --pr-mode`,
 	Args: cobra.ExactArgs(1),
 	RunE: runWlDone,
 }
@@ -37,6 +42,7 @@ Examples:
 func init() {
 	wlDoneCmd.Flags().StringVar(&wlDoneEvidence, "evidence", "", "Evidence URL or description (required)")
 	_ = wlDoneCmd.MarkFlagRequired("evidence")
+	wlDoneCmd.Flags().BoolVar(&wlDonePRMode, "pr-mode", false, "Create a DoltHub PR instead of writing directly (Phase 2)")
 
 	wlCmd.AddCommand(wlDoneCmd)
 }
@@ -62,6 +68,10 @@ func runWlDone(cmd *cobra.Command, args []string) error {
 	store := doltserver.NewWLCommons(townRoot)
 	completionID := generateCompletionID(wantedID, rigHandle)
 
+	if wlDonePRMode {
+		return runWlDonePR(store, wlCfg, wantedID, rigHandle, wlDoneEvidence, completionID)
+	}
+
 	if err := submitDone(store, wantedID, rigHandle, wlDoneEvidence, completionID); err != nil {
 		return err
 	}
@@ -71,6 +81,66 @@ func runWlDone(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Completed by: %s\n", rigHandle)
 	fmt.Printf("  Evidence: %s\n", wlDoneEvidence)
 	fmt.Printf("  Status: in_review\n")
+
+	return nil
+}
+
+// runWlDonePR implements the Phase 2 PR-based completion flow:
+// 1. Verify item is claimed by this rig
+// 2. Create a Dolt branch, write completion, commit, push
+// 3. Create a DoltHub PR from the fork branch to upstream main
+func runWlDonePR(store doltserver.WLCommonsStore, wlCfg *wasteland.Config, wantedID, rigHandle, evidence, completionID string) error {
+	// Verify the item exists and is claimed by us
+	item, err := store.QueryWanted(wantedID)
+	if err != nil {
+		return fmt.Errorf("querying wanted item: %w", err)
+	}
+	if item.Status != "claimed" {
+		return fmt.Errorf("wanted item %s is not claimed (status: %s)", wantedID, item.Status)
+	}
+	if item.ClaimedBy != rigHandle {
+		return fmt.Errorf("wanted item %s is claimed by %q, not %q", wantedID, item.ClaimedBy, rigHandle)
+	}
+
+	branchName := fmt.Sprintf("wl/%s/done-%s", rigHandle, wantedID)
+	token := wasteland.GetDoltHubToken()
+	if token == "" {
+		return fmt.Errorf("DOLTHUB_TOKEN is required for --pr-mode")
+	}
+
+	// Create branch, write completion on branch, commit, push
+	fmt.Printf("Creating branch %s...\n", branchName)
+	if err := doltserver.SubmitCompletionOnBranch(wlCfg.LocalDir, completionID, wantedID, rigHandle, evidence, branchName); err != nil {
+		return fmt.Errorf("branch completion failed: %w", err)
+	}
+
+	// Push branch to fork
+	fmt.Printf("Pushing branch to %s/%s...\n", wlCfg.ForkOrg, wlCfg.ForkDB)
+	if err := wasteland.PushBranch(wlCfg.LocalDir, "origin", branchName); err != nil {
+		return fmt.Errorf("push failed: %w", err)
+	}
+
+	// Create DoltHub PR
+	upstreamOrg, upstreamDB, err := wasteland.ParseUpstream(wlCfg.Upstream)
+	if err != nil {
+		return fmt.Errorf("parsing upstream: %w", err)
+	}
+
+	title := fmt.Sprintf("wl done: %s by %s", wantedID, rigHandle)
+	description := fmt.Sprintf("Completion for wanted item %s\nEvidence: %s\nCompletion ID: %s", wantedID, evidence, completionID)
+
+	fmt.Printf("Creating DoltHub PR: %s -> %s/%s:main...\n", branchName, upstreamOrg, upstreamDB)
+	prURL, err := wasteland.CreateDoltHubPR(upstreamOrg, upstreamDB, wlCfg.ForkOrg, branchName, "main", title, description, token)
+	if err != nil {
+		return fmt.Errorf("DoltHub PR creation failed: %w\nFallback: use 'gt wl done %s --evidence %q' (without --pr-mode) for direct write", err, wantedID, evidence)
+	}
+
+	fmt.Printf("%s PR created for completion %s\n", style.Bold.Render("✓"), wantedID)
+	fmt.Printf("  Completion ID: %s\n", completionID)
+	fmt.Printf("  Branch: %s\n", branchName)
+	fmt.Printf("  PR: %s\n", prURL)
+	fmt.Printf("  Evidence: %s\n", evidence)
+	fmt.Printf("  Awaiting merge (trust-tier dependent)\n")
 
 	return nil
 }

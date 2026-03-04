@@ -394,3 +394,74 @@ func NewService() *Service {
 		Config: &fileConfigStore{},
 	}
 }
+
+// GetDoltHubToken returns the DoltHub API token from the environment.
+func GetDoltHubToken() string {
+	return os.Getenv("DOLTHUB_TOKEN")
+}
+
+// PushBranch pushes a specific branch to a remote.
+func PushBranch(localDir, remote, branch string) error {
+	cmd := exec.Command("dolt", "push", remote, branch)
+	cmd.Dir = localDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dolt push %s %s: %w (%s)", remote, branch, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// CreateDoltHubPR creates a pull request on DoltHub to merge a branch from
+// a fork into the upstream repository.
+// Returns the PR URL on success.
+func CreateDoltHubPR(upstreamOrg, upstreamDB, forkOrg, fromBranch, toBranch, title, description, token string) (string, error) {
+	body := map[string]string{
+		"title":               title,
+		"description":         description,
+		"fromBranchOwnerName": forkOrg,
+		"fromBranchRepoName":  upstreamDB,
+		"fromBranchName":      fromBranch,
+		"toBranchOwnerName":   upstreamOrg,
+		"toBranchRepoName":    upstreamDB,
+		"toBranchName":        toBranch,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("marshaling PR request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/%s/%s/pulls", dolthubAPIBase, upstreamOrg, upstreamDB)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("creating PR request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("authorization", "token "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("DoltHub PR API request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var result struct {
+			Status string `json:"status"`
+			PRID   string `json:"pull_id"`
+		}
+		if decErr := json.NewDecoder(resp.Body).Decode(&result); decErr == nil && result.PRID != "" {
+			return fmt.Sprintf("https://www.dolthub.com/repositories/%s/%s/pulls/%s", upstreamOrg, upstreamDB, result.PRID), nil
+		}
+		return fmt.Sprintf("https://www.dolthub.com/repositories/%s/%s/pulls", upstreamOrg, upstreamDB), nil
+	}
+
+	var errResp struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if decErr := json.NewDecoder(resp.Body).Decode(&errResp); decErr == nil {
+		return "", fmt.Errorf("DoltHub PR API error (HTTP %d): %s", resp.StatusCode, errResp.Message)
+	}
+	return "", fmt.Errorf("DoltHub PR API error (HTTP %d)", resp.StatusCode)
+}

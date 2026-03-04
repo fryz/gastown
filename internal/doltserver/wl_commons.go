@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -442,4 +443,62 @@ func parseCSVLine(line string) []string {
 	}
 	fields = append(fields, field.String())
 	return fields
+}
+
+// ClaimWantedOnBranch creates a Dolt branch, writes a claim on that branch,
+// and commits. Used by the Phase 2 PR-based flow.
+func ClaimWantedOnBranch(localDir, wantedID, rigHandle, branchName string) error {
+	script := fmt.Sprintf(`CALL DOLT_BRANCH('%s');
+CALL DOLT_CHECKOUT('%s');
+UPDATE wanted SET claimed_by='%s', status='claimed', updated_at=NOW()
+  WHERE id='%s' AND status='open';
+CALL DOLT_ADD('-A');
+CALL DOLT_COMMIT('-m', 'wl claim: %s by %s');
+CALL DOLT_CHECKOUT('main');
+`,
+		EscapeSQL(branchName), EscapeSQL(branchName),
+		EscapeSQL(rigHandle), EscapeSQL(wantedID),
+		EscapeSQL(wantedID), EscapeSQL(rigHandle))
+
+	return doltSQLScriptInDir(localDir, script)
+}
+
+// SubmitCompletionOnBranch creates a Dolt branch, writes a completion on that branch,
+// and commits. Used by the Phase 2 PR-based flow.
+func SubmitCompletionOnBranch(localDir, completionID, wantedID, rigHandle, evidence, branchName string) error {
+	script := fmt.Sprintf(`CALL DOLT_BRANCH('%s');
+CALL DOLT_CHECKOUT('%s');
+UPDATE wanted SET status='in_review', evidence_url='%s', updated_at=NOW()
+  WHERE id='%s' AND status='claimed' AND claimed_by='%s';
+INSERT IGNORE INTO completions (id, wanted_id, completed_by, evidence, completed_at)
+  SELECT '%s', '%s', '%s', '%s', NOW()
+  FROM wanted WHERE id='%s' AND status='in_review' AND claimed_by='%s'
+  AND NOT EXISTS (SELECT 1 FROM completions WHERE wanted_id='%s');
+CALL DOLT_ADD('-A');
+CALL DOLT_COMMIT('-m', 'wl done: %s by %s');
+CALL DOLT_CHECKOUT('main');
+`,
+		EscapeSQL(branchName), EscapeSQL(branchName),
+		EscapeSQL(evidence), EscapeSQL(wantedID), EscapeSQL(rigHandle),
+		EscapeSQL(completionID), EscapeSQL(wantedID), EscapeSQL(rigHandle), EscapeSQL(evidence),
+		EscapeSQL(wantedID), EscapeSQL(rigHandle), EscapeSQL(wantedID),
+		EscapeSQL(wantedID), EscapeSQL(rigHandle))
+
+	return doltSQLScriptInDir(localDir, script)
+}
+
+// doltSQLScriptInDir runs a SQL script using `dolt sql` in a specific directory.
+// Unlike doltSQLScriptWithRetry which uses the town-root Dolt server config,
+// this operates directly on a local Dolt clone.
+func doltSQLScriptInDir(localDir, script string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", script) // #nosec G204
+	cmd.Dir = localDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dolt sql failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
