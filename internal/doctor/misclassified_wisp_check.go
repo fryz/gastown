@@ -63,7 +63,12 @@ func (c *CheckMisclassifiedWisps) Run(ctx *CheckContext) *CheckResult {
 	if useDolt {
 		// Dolt path covers rig databases only (no town-level beads).
 		// Town-level beads are rare and covered by the JSONL fallback path.
+		registeredRigs := loadRegisteredRigNames(ctx.TownRoot)
 		for _, db := range databases {
+			// Skip non-rig system databases (e.g. wl_commons federation database).
+			if db != "hq" && !registeredRigs[db] {
+				continue
+			}
 			// The "hq" database lives at the town root itself, not townRoot/hq.
 			rigDir := filepath.Join(ctx.TownRoot, db)
 			if db == "hq" {
