@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/wasteland"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -94,6 +95,26 @@ func runWLSync(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n%s Synced with upstream\n", style.Bold.Render("✓"))
+
+	// Reconcile schema: detect and apply backward-compatible schema changes.
+	reconcileResult, err := doltserver.ReconcileSchema(townRoot, forkDir)
+	if err != nil {
+		fmt.Printf("\n%s Schema reconciliation failed: %v\n", style.Bold.Render("!"), err)
+		fmt.Printf("  The sync completed, but schema changes could not be auto-applied.\n")
+	} else if len(reconcileResult.Changes) > 0 {
+		fmt.Printf("\n%s Schema evolution: %d change(s) detected, %d applied\n",
+			style.Bold.Render("~"), len(reconcileResult.Changes), reconcileResult.Applied)
+		for _, c := range reconcileResult.Changes {
+			prefix := "  +"
+			if c.Breaking {
+				prefix = "  !"
+			}
+			fmt.Printf("%s %s\n", prefix, c.Detail)
+		}
+		for _, w := range reconcileResult.Warnings {
+			fmt.Printf("  %s %s\n", style.Bold.Render("warning:"), w)
+		}
+	}
 
 	// Show summary
 	summaryQuery := `SELECT
