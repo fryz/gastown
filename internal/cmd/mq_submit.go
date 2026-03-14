@@ -14,7 +14,6 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
-	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -134,11 +133,9 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
-	}
+	// Get configured default branch for this rig via the layered config system.
+	// Uses wisp → bead labels → config.json → "main" fallback chain.
+	defaultBranch := loadRigDefaultBranch(townRoot, rigName)
 
 	if branch == defaultBranch || branch == "master" {
 		return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)

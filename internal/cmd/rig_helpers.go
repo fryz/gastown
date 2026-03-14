@@ -64,6 +64,31 @@ func getRig(rigName string) (string, *rig.Rig, error) {
 	return townRoot, r, nil
 }
 
+// loadRigDefaultBranch returns the configured default branch for a rig.
+// It uses the full layered config system (wisp → bead labels → config.json → "main"),
+// ensuring rigs that store default_branch in bead labels (not config.json) work correctly.
+func loadRigDefaultBranch(townRoot, rigName string) string {
+	// Try the layered config system first (reads wisp + bead labels).
+	// Some rigs (e.g., arthur_engine) store default_branch in bead labels via
+	// gt rig config set --global, not in config.json.
+	rigsConfigPath := constants.MayorRigsPath(townRoot)
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err == nil {
+		g := git.NewGit(townRoot)
+		mgr := rig.NewManager(townRoot, rigsConfig, g)
+		if r, getErr := mgr.GetRig(rigName); getErr == nil {
+			if branch := r.GetStringConfig("default_branch"); branch != "" {
+				return branch
+			}
+		}
+	}
+	// Fall back to config.json (for rigs using the older config format).
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		return rigCfg.DefaultBranch
+	}
+	return "main"
+}
+
 // hasRigBeadLabel checks if a rig's identity bead has a specific label.
 // Returns false if the rig config or bead can't be loaded (safe default).
 func hasRigBeadLabel(townRoot, rigName, label string) bool {

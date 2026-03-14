@@ -17,7 +17,6 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
-	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
@@ -334,11 +333,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
 	}
 
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
-	}
+	// Get configured default branch for this rig via the layered config system.
+	// Uses wisp → bead labels → config.json → "main" fallback chain.
+	defaultBranch := loadRigDefaultBranch(townRoot, rigName)
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
