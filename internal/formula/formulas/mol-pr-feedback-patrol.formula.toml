@@ -1,0 +1,459 @@
+description = """
+PR review feedback patrol loop.
+
+Closes the GitHub review feedback loop autonomously. Polls open PRs across
+all rigs, detects review decisions, and takes action:
+
+- **CHANGES_REQUESTED**: Creates a rework bead with full review context and
+  slinging a new polecat to address the feedback.
+- **APPROVED + checks passing**: Sends MERGE_READY to the refinery for final merge.
+
+## Design Philosophy
+
+This patrol follows Gas Town principles:
+- **Discovery over tracking**: Observe GitHub state each cycle, act on current state
+- **No duplicate dispatch**: Track dispatched PRs via ephemeral wisps to avoid
+  creating multiple rework beads for the same PR
+- **Minimal footprint**: PR-feedback patrol runs on a fixed interval with
+  exponential backoff when no open PRs exist
+- **Swim lane discipline**: Only close wisps YOU created. Wisp lifecycle for
+  other agents' wisps belongs to the reaper Dog.
+
+## Branch Name Convention
+
+Polecat branches follow `polecat/<name>` pattern. This patrol only processes
+PRs whose head branch matches this pattern — external contributor PRs are out
+of scope (handled by mol-polecat-review-pr).
+
+## PR States Handled
+
+| reviewDecision       | Checks   | Action                              |
+|----------------------|----------|-------------------------------------|
+| CHANGES_REQUESTED    | any      | Create rework bead + re-sling       |
+| APPROVED             | passing  | Send MERGE_READY to refinery        |
+| APPROVED             | pending  | Skip — wait for checks to settle    |
+| APPROVED             | failing  | Escalate — approved but CI failing  |
+| REVIEW_REQUIRED      | any      | Skip — no decision yet              |
+| (none)               | any      | Skip — awaiting first review        |
+
+## Patrol Shape (Linear)
+
+```
+init ─► scan-prs ─► process-changes-requested ─► process-approved
+                                                        │
+               ┌────────────────────────────────────────┘
+               ▼
+      patrol-cleanup ─► context-check ─► loop-or-exit
+```
+"""
+formula = "mol-pr-feedback-patrol"
+version = 1
+
+[vars]
+[vars.wisp_type]
+description = "Type of wisp created for this molecule"
+default = "patrol"
+
+[vars.poll_interval]
+description = "Base poll interval (seconds) when PRs are active"
+default = "300"
+
+[vars.backoff_max]
+description = "Maximum backoff interval (seconds) when no PRs are open"
+default = "600"
+
+[[steps]]
+id = "init"
+title = "Initialize patrol cycle"
+description = """
+Initialize the patrol cycle and clean up stale wisps from previous cycles.
+
+**Step 1: Clean up your own wisps from previous cycles:**
+```bash
+bd mol wisp gc --closed --force
+bd mol wisp gc --age 2h --force
+```
+
+🚨 **SWIM LANE RULE: Do NOT close wisps you didn't create.**
+This patrol creates wisps with label `pr-feedback-patrol`. Only GC those.
+Foreign wisps (polecat work, witness cleanup, etc.) are NOT yours to close.
+
+**Step 2: Create a patrol cycle digest wisp to track this cycle:**
+```bash
+bd create --ephemeral --wisp-type patrol --title "pr-feedback-patrol: cycle $(date -u +%Y%m%dT%H%M)" \
+  --labels pr-feedback-patrol,cycle-start:$(date -u +%s)
+```
+Note the wisp ID — use it with `gt patrol report` at cycle end.
+
+**Exit criteria:** Stale wisps cleaned up, cycle wisp created.
+"""
+
+[[steps]]
+id = "scan-prs"
+title = "Scan all rigs for open polecat PRs"
+needs = ["init"]
+description = """
+Fetch all open PRs across all rigs and classify them by review decision.
+
+**Step 1: Get all configured rigs:**
+```bash
+gt rig list --json
+```
+
+This returns JSON with each rig's name and GitHub remote URL. For each rig,
+you'll query its GitHub repo for open PRs.
+
+**Step 2: For each rig, list open PRs from polecat branches:**
+```bash
+# For each rig (substitute <owner>/<repo> from `git remote -v` or rig config):
+gh pr list --repo <owner>/<repo> \
+  --state open \
+  --json number,headRefName,reviewDecision,statusCheckRollup,body,author,url \
+  --jq '[.[] | select(.headRefName | startswith("polecat/"))]'
+```
+
+This filters to only polecat branches (pattern: `polecat/<name>`).
+
+**Step 3: Classify each PR by review decision:**
+
+Build two lists from the results:
+- `changes_requested_prs`: PRs where `reviewDecision == "CHANGES_REQUESTED"`
+- `approved_passing_prs`: PRs where `reviewDecision == "APPROVED"` AND all
+  required status checks pass (statusCheckRollup shows SUCCESS or NEUTRAL only)
+- `approved_failing_prs`: PRs where `reviewDecision == "APPROVED"` AND any
+  required check is FAILURE or ERROR
+- `skip_prs`: Everything else (REVIEW_REQUIRED, no decision, pending checks)
+
+**Step 4: Deduplicate against already-dispatched wisps:**
+
+For CHANGES_REQUESTED PRs, check if a rework wisp already exists to avoid
+double-dispatch:
+```bash
+bd list --label pr-rework --status=open --json
+```
+
+For each PR in `changes_requested_prs`, check if the list contains a wisp
+with label `pr:<number>`. If yes, skip that PR (already dispatched).
+
+**Step 5: Log findings:**
+
+Output a summary:
+```
+Scan complete:
+  CHANGES_REQUESTED (new):  N
+  CHANGES_REQUESTED (already dispatched): N
+  APPROVED + passing: N
+  APPROVED + failing: N
+  Skipped (no decision/pending): N
+```
+
+**Exit criteria:** PRs classified, deduplication complete, lists ready.
+"""
+
+[[steps]]
+id = "process-changes-requested"
+title = "Dispatch rework for CHANGES_REQUESTED PRs"
+needs = ["scan-prs"]
+description = """
+For each new (not-yet-dispatched) CHANGES_REQUESTED PR, create a rework bead
+with full review context and sling a new polecat to address the feedback.
+
+If no new CHANGES_REQUESTED PRs exist, skip this step.
+
+**For each CHANGES_REQUESTED PR:**
+
+**Step 1: Fetch review details:**
+```bash
+gh pr review list --repo <owner>/<repo> <pr-number> \
+  --json author,body,state,submittedAt \
+  --jq '[.[] | select(.state == "CHANGES_REQUESTED")]'
+
+gh pr view <pr-number> --repo <owner>/<repo> \
+  --json title,body,headRefName,baseRefName,url
+```
+
+Also fetch inline review comments:
+```bash
+gh api repos/<owner>/<repo>/pulls/<pr-number>/comments \
+  --jq '[.[] | {author: .user.login, body: .body, path: .path, line: .line}]'
+```
+
+**Step 2: Identify the associated rig and original bead:**
+
+The branch name is `polecat/<name>` — extract the polecat name.
+Find the original work bead from the PR description or branch name:
+```bash
+# Look for bead ID in the PR body (polecats include it in their commit/PR)
+# Pattern: issue or bead ID like "gt-abc", "hq-xyz", etc.
+# Fallback: search beads by branch name
+bd list --label branch:<headRefName> --json
+```
+
+**Step 3: Create a rework bead with full review context:**
+```bash
+bd create \
+  --title "Rework: <original-title> (review feedback)" \
+  --type task \
+  --priority 2 \
+  --description "$(cat <<'BODY'
+## PR Rework Required
+
+**Original PR**: <pr-url>
+**Branch**: <headRefName>
+**Original issue**: <original-bead-id>
+
+## Review Decision: CHANGES_REQUESTED
+
+### Reviewer feedback:
+
+<reviewer-name> wrote:
+<review-body>
+
+### Inline comments:
+
+<path>:<line>: <comment-body>
+(repeat for each inline comment)
+
+## Instructions for rework polecat
+
+1. Check out the branch: `git fetch origin <headRefName> && git checkout <headRefName>`
+2. Address each piece of feedback listed above
+3. Commit and push: `git push origin <headRefName>`
+4. The PR will update automatically; post a comment summarizing changes made
+5. When done, run `gt done` as usual
+
+## Context
+
+The reviewer's feedback must be addressed before this PR can merge.
+Address all CHANGES_REQUESTED items, then push to the same branch.
+BODY
+)"
+```
+
+Note the new rework bead ID as `<rework-bead-id>`.
+
+**Step 4: Create a tracking wisp to prevent duplicate dispatch:**
+```bash
+bd create --ephemeral --title "pr-rework: <pr-number>" \
+  --labels pr-rework,pr:<pr-number>,rig:<rig-name>,rework-bead:<rework-bead-id>
+```
+
+**Step 5: Sling a polecat to address the rework:**
+```bash
+gt sling <rework-bead-id> <rig-name>
+```
+
+**Step 6: Post a comment on the PR noting rework is dispatched:**
+```bash
+gh pr comment <pr-number> --repo <owner>/<repo> \
+  --body "♻️ **Rework dispatched** — A new polecat has been assigned to address the review feedback (bead: \`<rework-bead-id>\`). The PR will be updated when the rework is complete."
+```
+
+**Step 7: Log the dispatch:**
+```
+Dispatched rework for PR #<number>: <title>
+  Rework bead: <rework-bead-id>
+  Tracking wisp: <wisp-id>
+```
+
+**On error (sling fails):**
+Escalate and leave the tracking wisp open for retry:
+```bash
+gt escalate "PR feedback patrol: failed to sling rework for PR #<number> in <rig>" \
+  -s MEDIUM
+```
+
+**Exit criteria:** All new CHANGES_REQUESTED PRs have rework beads + polecats dispatched
+OR escalated if sling failed. Tracking wisps created for all dispatched PRs.
+"""
+
+[[steps]]
+id = "process-approved"
+title = "Send MERGE_READY for approved PRs"
+needs = ["process-changes-requested"]
+description = """
+For each PR with reviewDecision=APPROVED and all checks passing, send
+MERGE_READY to the refinery. For approved PRs with failing checks, escalate.
+
+If no approved PRs exist, skip this step.
+
+**For each APPROVED + passing PR:**
+
+**Step 1: Verify checks are still passing (re-check to avoid TOCTOU):**
+```bash
+gh pr view <pr-number> --repo <owner>/<repo> \
+  --json reviewDecision,statusCheckRollup,mergeable
+```
+
+If reviewDecision changed or checks failed since scan, skip this PR (stale state).
+
+**Step 2: Find the associated MR bead:**
+```bash
+# Search for an MR bead associated with this branch
+gt mq list <rig-name> | grep <headRefName>
+# Or: bd list --label branch:<headRefName> --status=open --json
+```
+
+If no MR bead is found, the PR was opened via the PR workflow (not merge queue).
+In this case, notify the refinery to handle the merge directly:
+
+**Step 3a: If MR bead exists (merge queue workflow):**
+```bash
+gt mail send <rig-name>/refinery -s "MERGE_READY" --stdin <<BODY
+Branch: <headRefName>
+Issue: <original-bead-id>
+Polecat: <polecat-name>
+MR: <mr-bead-id>
+Verified: clean git state, issue closed
+PR: <pr-url>
+BODY
+```
+
+Then emit the file event to unblock the refinery's await-event:
+```bash
+gt mol step emit-event --channel refinery --type MERGE_READY \
+  --payload source=pr-feedback-patrol \
+  --payload branch=<headRefName> \
+  --payload pr=<pr-number>
+```
+
+**Step 3b: If no MR bead (direct PR workflow, no merge queue):**
+The polecat opened a PR directly. Notify the rig's refinery to merge the PR:
+```bash
+gt mail send <rig-name>/refinery -s "PR_MERGE_READY" --stdin <<BODY
+PR: <pr-url>
+PR Number: <pr-number>
+Branch: <headRefName>
+Target: <baseRefName>
+Issue: <original-bead-id>
+Polecat: <polecat-name>
+Review: APPROVED
+Checks: PASSING
+BODY
+```
+
+**Step 4: Log the notification:**
+```
+Sent MERGE_READY for PR #<number>: <title>
+  Branch: <headRefName>
+  Target: <baseRefName>
+  Polecat: <polecat-name>
+```
+
+**For each APPROVED + FAILING checks PR:**
+
+This is abnormal — a reviewer approved code that fails CI. Escalate:
+```bash
+gt escalate "PR feedback patrol: PR #<number> in <rig> is APPROVED but CI is failing" \
+  -s HIGH
+gt mail send <rig-name>/witness -s "ALERT: Approved PR with failing CI" \
+  -m "PR #<number> (<pr-url>) is APPROVED but required checks are failing.
+Please investigate and advise."
+```
+
+**Exit criteria:** All approved+passing PRs have MERGE_READY sent. Failing CI on
+approved PRs is escalated.
+"""
+
+[[steps]]
+id = "patrol-cleanup"
+title = "End-of-cycle cleanup"
+needs = ["process-approved"]
+description = """
+Clean up and finalize the patrol cycle.
+
+**Step 1: Log cycle summary:**
+
+Summarize what happened this cycle:
+- PRs scanned across all rigs
+- CHANGES_REQUESTED dispatched (count)
+- MERGE_READY sent (count)
+- Escalations filed (count)
+- PRs skipped (count)
+
+**Step 2: Close the patrol cycle digest wisp:**
+```bash
+gt patrol report --summary "<brief summary: N CHANGES_REQUESTED dispatched, N MERGE_READY sent>"
+```
+
+This closes the current patrol wisp and creates a new one for the next cycle.
+
+**Exit criteria:** Cycle summarized and logged. Patrol wisp closed.
+"""
+
+[[steps]]
+id = "context-check"
+title = "Check own context limit"
+needs = ["patrol-cleanup"]
+description = """
+Check own context usage.
+
+If context is HIGH (>80%):
+- Ensure any notes are written to handoff mail
+- Prepare for session restart
+
+If context is LOW:
+- Can continue patrolling
+"""
+
+[[steps]]
+id = "loop-or-exit"
+title = "Loop or exit for respawn"
+needs = ["context-check"]
+description = """
+End of patrol cycle decision.
+
+**If context LOW** (can continue patrolling):
+
+Resolve your agent bead ID for this patrol cycle. You MUST replace `<YOUR_RIG>` below
+with your actual rig name (e.g., `gastown`, `beads`) before running:
+```bash
+bd list --type=agent --desc-contains="role_type: pr-feedback-patrol" --json | \
+  jq -r '.[] | select(.status != "closed") | select(.description | test("(?m)^\\s*rig: <YOUR_RIG>\\s*$")) | .id'
+```
+This must return exactly one bead ID. If it returns zero or multiple results, STOP
+and escalate — do not continue.
+
+Use await-signal with backoff tuned to PR review cadence:
+
+```bash
+gt mol step await-signal --agent-bead YOUR_AGENT_BEAD \
+  --backoff-base {{poll_interval}}s --backoff-mult 1.5 --backoff-max {{backoff_max}}s
+```
+
+This command:
+1. Subscribes to `bd activity --follow` (beads activity feed)
+2. Returns IMMEDIATELY when any beads activity occurs
+3. If no activity, times out per backoff schedule:
+   - First timeout: {{poll_interval}}s (default: 5 minutes)
+   - Subsequent: up to {{backoff_max}}s (default: 10 minutes)
+4. Tracks `idle:N` label on your agent bead for backoff state
+
+**On signal received** (activity detected — e.g., new PR opened or bead updated):
+Reset the idle counter:
+```bash
+gt agent state YOUR_AGENT_BEAD --set idle=0
+```
+
+**On timeout** (no activity within interval):
+The idle counter was auto-incremented. Continue to next patrol cycle.
+Longer backoff applies next time (no open PRs → less frequent polling).
+
+After await-signal returns:
+1. Continue executing from the first step (`init`) of the new patrol cycle
+
+**If context HIGH** (approaching limit):
+1. Write handoff mail with notable observations:
+```bash
+gt handoff -s "PR feedback patrol handoff" \
+  -m "Cycle observations: <N> PRs dispatched for rework, <N> MERGE_READY sent.
+Any pending escalations: <describe if any>"
+```
+2. Exit cleanly — the daemon will respawn a fresh session
+
+**NOTE (gt-058d)**: `gt handoff` enforces a minimum 2-minute cooldown between
+handoffs. This prevents tight restart loops when the rig is idle.
+
+**IMPORTANT**: You must either loop (context LOW) or exit (context HIGH).
+Never leave the session idle without work on your hook.
+"""
