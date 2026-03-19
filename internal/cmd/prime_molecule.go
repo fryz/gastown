@@ -105,10 +105,41 @@ func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 	}
 }
 
+// parseExtraVars converts []string of "key=value" pairs into a map.
+// Splits on the first '=' only, so values containing '=' are preserved.
+func parseExtraVars(extraVars []string) map[string]string {
+	m := make(map[string]string, len(extraVars))
+	for _, kv := range extraVars {
+		idx := strings.IndexByte(kv, '=')
+		if idx < 0 {
+			continue
+		}
+		m[kv[:idx]] = kv[idx+1:]
+	}
+	return m
+}
+
+// applyFormulaVars builds a resolved vars map from formula defaults overridden
+// by the provided rig-specific vars, then substitutes {{key}} in the given string.
+func applyFormulaVars(s string, f *formula.Formula, overrides map[string]string) string {
+	resolved := make(map[string]string, len(f.Vars))
+	for k, v := range f.Vars {
+		resolved[k] = v.Default
+	}
+	for k, v := range overrides {
+		resolved[k] = v
+	}
+	for k, v := range resolved {
+		s = strings.ReplaceAll(s, "{{"+k+"}}", v)
+	}
+	return s
+}
+
 // showFormulaSteps renders the formula steps inline in the prime output.
 // Agents read these steps instead of materializing them as wisp rows.
 // The label parameter customizes the section header (e.g., "Patrol Steps", "Work Steps").
-func showFormulaSteps(formulaName, label string) {
+// The vars parameter provides key=value overrides for {{variable}} substitution.
+func showFormulaSteps(formulaName, label string, vars ...map[string]string) {
 	content, err := formula.GetEmbeddedFormulaContent(formulaName)
 	if err != nil {
 		style.PrintWarning("could not load formula %s: %v", formulaName, err)
@@ -125,10 +156,16 @@ func showFormulaSteps(formulaName, label string) {
 		return
 	}
 
+	var overrides map[string]string
+	if len(vars) > 0 {
+		overrides = vars[0]
+	}
+
 	fmt.Println()
 	fmt.Printf("**%s** (%d steps from %s):\n", label, len(f.Steps), formulaName)
 	for i, step := range f.Steps {
-		fmt.Printf("  %d. **%s** — %s\n", i+1, step.Title, truncateDescription(step.Description, 120))
+		desc := applyFormulaVars(step.Description, f, overrides)
+		fmt.Printf("  %d. **%s** — %s\n", i+1, step.Title, truncateDescription(desc, 120))
 	}
 	fmt.Println()
 }
@@ -273,7 +310,7 @@ func outputRefineryPatrolContext(ctx RoleContext) {
 		},
 	}
 	outputPatrolContext(cfg)
-	showFormulaSteps(constants.MolRefineryPatrol, "Patrol Steps")
+	showFormulaSteps(constants.MolRefineryPatrol, "Patrol Steps", parseExtraVars(cfg.ExtraVars))
 }
 
 // buildRefineryPatrolVars loads rig MQ settings and returns --var key=value
